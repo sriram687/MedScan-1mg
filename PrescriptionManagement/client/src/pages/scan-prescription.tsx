@@ -1,0 +1,655 @@
+import { useState } from "react";
+import { useMutation } from "@tanstack/react-query";
+import { useLocation } from "wouter";
+import { useTesseract } from "@/hooks/use-prescription-scanner";
+import { useToast } from "@/hooks/use-toast";
+import { useCart } from "@/context/CartContext";
+import { useAuth } from "@/context/AuthContext";
+
+import { Loader, PlusCircle, Trash2, Check, XCircle, ShoppingCart } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
+import { Label } from "@/components/ui/label";
+import { Input } from "@/components/ui/input";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+
+interface ManualMed {
+  name: string;
+  composition: string;
+}
+
+interface SearchResult {
+  found: boolean;
+  medicineId?: string;
+  medicineName?: string;
+  stock?: number;
+}
+
+interface ExtractedMedicine {
+  name: string;
+  strength: string | null;
+  form: string | null;
+  frequency: string | null;
+  duration: string | null;
+  instructions: string | null;
+  uses: string | null;
+  confidence: number;
+  query: string;
+}
+
+interface ProcessedMedicineResult {
+  extracted: ExtractedMedicine;
+  status: "added" | "not_found" | "error";
+  matchedMedicine?: {
+    _id: string;
+    name: string;
+    prescriptionRequired?: boolean;
+  };
+  message?: string;
+}
+
+export default function ScanPrescription() {
+  const [, navigate] = useLocation();
+  const { toast } = useToast();
+  const { addToCart } = useCart();
+  const { isAuthenticated } = useAuth();
+  const API_ROOT = (import.meta.env.VITE_API_URL || 'http://localhost:5000').replace(/\/+$/, '');
+  const API_BASE_URL = API_ROOT.endsWith('/api') ? API_ROOT : `${API_ROOT}/api`;
+  
+  // Image scanning state
+  const [capturedImage, setCapturedImage] = useState<string | null>(null);
+  const [manualEntry, setManualEntry] = useState(false);
+  const { recognizeText, isRecognizing, recognizedText } = useTesseract();
+
+  // Manual entry state
+  const [doctorName, setDoctorName] = useState("");
+  const [prescriptionDate, setPrescriptionDate] = useState("");
+  const [medications, setMedications] = useState<ManualMed[]>([
+    { name: "", composition: "" }
+  ]);
+  const [searchResults, setSearchResults] = useState<Record<number, SearchResult>>({});
+
+  const [processedResults, setProcessedResults] = useState<ProcessedMedicineResult[] | null>(null);
+  const [isAutoProcessing, setIsAutoProcessing] = useState(false);
+
+  // Search medicines mutation
+  const searchMutation = useMutation({
+    mutationFn: async (meds: ManualMed[]) => {
+      const promises = meds.map(async (med) => {
+        const searchQuery = med.name || med.composition;
+        if (!searchQuery.trim()) {
+          return { success: true, data: [] };
+        }
+        
+        try {
+          const response = await fetch(`${API_BASE_URL}/medicines/search?query=${encodeURIComponent(searchQuery)}`, {
+            method: 'GET',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${localStorage.getItem('token')}`
+            }
+          });
+          
+          if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+          }
+          
+          return await response.json();
+        } catch (error) {
+          console.error('Search request failed:', error);
+          return { success: false, data: [] };
+        }
+      });
+      
+      return Promise.all(promises);
+    },
+    onSuccess: (responses) => {
+      const results: Record<number, SearchResult> = {};
+
+      responses.forEach((res, idx) => {
+        if (res.success && res.data.length > 0) {
+          results[idx] = {
+            found: true,
+            medicineId: res.data[0]._id,
+            medicineName: res.data[0].name,
+            stock: res.data[0].stock || 0
+          };
+        } else {
+          results[idx] = { found: false };
+        }
+      });
+      
+      setSearchResults(results);
+    },
+    onError: (err: any) => {
+      toast({
+        title: "Search failed",
+        description: err.message ?? "Couldn't search medicines",
+        variant: "destructive"
+      });
+    }
+  });
+
+  // Add to cart mutation
+  const addToCartMutation = useMutation({
+    mutationFn: async ({ medicineId }: { medicineId: string }) => {
+      await addToCart(medicineId, 1);
+    },
+    onSuccess: () => {
+      toast({ title: "Added to cart", description: "Medicine added successfully." });
+    },
+    onError: (err: any) => {
+      toast({
+        title: "Cart error",
+        description: err.message ?? "Couldn't add to cart",
+        variant: "destructive"
+      });
+    }
+  });
+
+  const extractMutation = useMutation({
+    mutationFn: async (text: string) => {
+      const response = await fetch(`${API_BASE_URL}/prescriptions/extract`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${localStorage.getItem('token')}`
+        },
+        body: JSON.stringify({ text })
+      });
+
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err?.message || `Extract failed (${response.status})`);
+      }
+
+      const data = await response.json();
+      return data?.data?.medicines as ExtractedMedicine[];
+    }
+  });
+
+  // File handling
+  const handleFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const base64data = reader.result as string;
+      setCapturedImage(base64data);
+      setProcessedResults(null);
+      recognizeText(base64data);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleTakePhoto = () => {
+    document.getElementById('file-input')?.click();
+  };
+
+  const searchFirstMatch = async (query: string) => {
+    const response = await fetch(`${API_BASE_URL}/medicines/search?query=${encodeURIComponent(query)}`, {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${localStorage.getItem('token')}`
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(`Search failed (${response.status})`);
+    }
+
+    const data = await response.json();
+    const first = data?.success && Array.isArray(data.data) ? data.data[0] : null;
+    return first || null;
+  };
+
+  const autoAddExtractedMedicines = async (meds: ExtractedMedicine[]) => {
+    setIsAutoProcessing(true);
+    try {
+      const results: ProcessedMedicineResult[] = [];
+
+      for (const med of meds) {
+        try {
+          const query = med.query || med.name;
+          if (!query?.trim()) {
+            results.push({ extracted: med, status: 'error', message: 'Empty medicine name' });
+            continue;
+          }
+
+          const match = await searchFirstMatch(query);
+          if (match?._id) {
+            await addToCart(match._id, 1);
+            results.push({
+              extracted: med,
+              status: 'added',
+              matchedMedicine: { _id: match._id, name: match.name, prescriptionRequired: match.prescriptionRequired }
+            });
+          } else {
+            results.push({ extracted: med, status: 'not_found' });
+          }
+        } catch (e: any) {
+          results.push({ extracted: med, status: 'error', message: e?.message || 'Failed' });
+        }
+
+        // Stream progress to UI as we go
+        setProcessedResults([...results]);
+      }
+
+      const addedCount = results.filter(r => r.status === 'added').length;
+      const notFoundCount = results.filter(r => r.status === 'not_found').length;
+
+      toast({
+        title: 'Prescription processed',
+        description: `${addedCount} added to cart${notFoundCount ? `, ${notFoundCount} not found` : ''}.`
+      });
+    } finally {
+      setIsAutoProcessing(false);
+    }
+  };
+
+  // Medication management
+  const addMedication = () => {
+    setMedications([...medications, { name: "", composition: "" }]);
+  };
+
+  const removeMedication = (idx: number) => {
+    setMedications(prev => prev.filter((_, i) => i !== idx));
+  };
+
+  const updateMedication = (idx: number, field: keyof ManualMed, value: string) => {
+    setMedications(prev =>
+      prev.map((m, i) => (i === idx ? { ...m, [field]: value } : m))
+    );
+  };
+
+  // Process prescription
+  const handleProcessPrescription = () => {
+    if (capturedImage) {
+      if (!isAuthenticated) {
+        toast({
+          title: 'Login required',
+          description: 'Please login to scan and add medicines to your cart.',
+          variant: 'destructive'
+        });
+        navigate('/login');
+        return;
+      }
+
+      if (isRecognizing) {
+        toast({
+          title: "Still processing image",
+          description: "Please wait for OCR recognition to finish.",
+          variant: "destructive"
+        });
+        return;
+      }
+
+      if (!recognizedText?.trim()) {
+        toast({
+          title: "No text detected",
+          description: "Try a clearer image or switch to manual entry.",
+          variant: "destructive"
+        });
+        return;
+      }
+
+      setProcessedResults(null);
+      extractMutation
+        .mutateAsync(recognizedText)
+        .then((meds) => {
+          if (!Array.isArray(meds) || meds.length === 0) {
+            toast({
+              title: 'No medicines detected',
+              description: 'Try a clearer image or use manual entry.',
+              variant: 'destructive'
+            });
+            return;
+          }
+          return autoAddExtractedMedicines(meds.slice(0, 12));
+        })
+        .catch((err: any) => {
+          toast({
+            title: 'Extraction failed',
+            description: err?.message ?? 'Could not extract medicines from text.',
+            variant: 'destructive'
+          });
+        });
+    } else if (manualEntry) {
+      // Validate basic fields (just for show)
+      if (!doctorName || !prescriptionDate) {
+        toast({
+          title: "Missing Information",
+          description: "Please fill doctor name and date",
+          variant: "destructive"
+        });
+        return;
+      }
+
+      if (!isAuthenticated) {
+        toast({
+          title: 'Login required',
+          description: 'Please login to add medicines to your cart.',
+          variant: 'destructive'
+        });
+        navigate('/login');
+        return;
+      }
+      
+      // Search medicines
+      searchMutation.mutate(medications);
+    } else {
+      toast({
+        title: "Missing Information",
+        description: "Please capture an image or enter prescription details.",
+        variant: "destructive"
+      });
+    }
+  };
+
+  return (
+    <div className="container mx-auto px-4 py-8 max-w-3xl">
+      <h1 className="text-2xl font-semibold mb-6">Scan Prescription</h1>
+      
+      <Card>
+        <CardHeader>
+          <CardTitle>
+            {manualEntry ? "Enter Prescription Details" : "Capture Prescription Image"}
+          </CardTitle>
+          <CardDescription>
+            {manualEntry 
+              ? "Enter doctor details and medicines to search our database" 
+              : "Take a clear photo of your prescription or upload an image"
+            }
+          </CardDescription>
+        </CardHeader>
+        
+        <CardContent>
+          {!manualEntry ? (
+            <div className="space-y-6">
+              {/* Image Upload Section */}
+              <div className="bg-gray-100 rounded-lg overflow-hidden aspect-[4/3] relative flex flex-col items-center justify-center">
+                {capturedImage ? (
+                  <>
+                    <img 
+                      src={capturedImage} 
+                      alt="Captured prescription" 
+                      className="w-full h-full object-contain"
+                    />
+                    <Button 
+                      variant="outline" 
+                      className="absolute top-2 right-2 bg-white"
+                      onClick={() => setCapturedImage(null)}
+                    >
+                      Replace
+                    </Button>
+                  </>
+                ) : (
+                  <>
+                    <div className="absolute inset-0 border-2 border-dashed border-primary/50 m-6 pointer-events-none"></div>
+                    <span className="text-5xl text-gray-400 mb-2">📷</span>
+                    <p className="text-sm text-gray-500">Position your prescription in the frame</p>
+                  </>
+                )}
+              </div>
+              
+              <input 
+                type="file" 
+                id="file-input" 
+                accept="image/*" 
+                className="hidden" 
+                aria-label="Upload prescription image"
+                onChange={handleFileInputChange}
+              />
+              
+              <div className="flex space-x-3">
+                <Button 
+                  className="flex-1" 
+                  onClick={handleTakePhoto}
+                  disabled={searchMutation.isPending || addToCartMutation.isPending}
+                >
+                  {capturedImage ? "Take New Photo" : "Take Photo"}
+                </Button>
+                <Button 
+                  variant="outline" 
+                  className="flex-1"
+                  onClick={() => document.getElementById('file-input')?.click()}
+                  disabled={searchMutation.isPending || addToCartMutation.isPending}
+                >
+                  Upload Image
+                </Button>
+              </div>
+              
+              {isRecognizing && (
+                <Alert>
+                  <Loader className="h-4 w-4 animate-spin mr-2" />
+                  <AlertDescription>
+                    Recognizing text in image...
+                  </AlertDescription>
+                </Alert>
+              )}
+
+              {(extractMutation.isPending || isAutoProcessing) && (
+                <Alert>
+                  <Loader className="h-4 w-4 animate-spin mr-2" />
+                  <AlertDescription>
+                    {extractMutation.isPending
+                      ? 'Extracting medicines from prescription...'
+                      : 'Matching medicines and adding to cart...'}
+                  </AlertDescription>
+                </Alert>
+              )}
+              
+              {recognizedText && (
+                <div className="border rounded-md p-3 bg-gray-50">
+                  <Label>Recognized Text (Preview)</Label>
+                  <div className="mt-1 font-mono text-xs max-h-40 overflow-y-auto p-2 bg-white">
+                    {recognizedText}
+                  </div>
+                </div>
+              )}
+
+              {processedResults && processedResults.length > 0 && (
+                <div className="border rounded-md p-4 bg-white space-y-3">
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-lg font-medium">Extracted Medicines</h3>
+                    <Button
+                      variant="outline"
+                      onClick={() => navigate('/cart')}
+                      disabled={isAutoProcessing}
+                    >
+                      Go to Cart
+                    </Button>
+                  </div>
+
+                  <div className="space-y-2">
+                    {processedResults.map((r, idx) => (
+                      <div key={idx} className="flex items-start justify-between gap-3 border rounded-md p-3">
+                        <div className="min-w-0">
+                          <div className="font-medium truncate">{r.extracted.name}</div>
+                          {(r.extracted.frequency || r.extracted.duration || r.extracted.instructions) && (
+                            <div className="text-xs text-gray-600 mt-1">
+                              {[r.extracted.frequency, r.extracted.duration, r.extracted.instructions]
+                                .filter(Boolean)
+                                .join(' • ')}
+                            </div>
+                          )}
+                          {r.status === 'not_found' && r.extracted.uses && (
+                            <div className="text-xs text-gray-600 mt-1">Uses: {r.extracted.uses}</div>
+                          )}
+                          {r.status === 'error' && (
+                            <div className="text-xs text-red-600 mt-1">{r.message || 'Failed to process'}</div>
+                          )}
+                        </div>
+
+                        <div className="shrink-0 text-sm">
+                          {r.status === 'added' && (
+                            <span className="text-green-700">Added</span>
+                          )}
+                          {r.status === 'not_found' && (
+                            <span className="text-amber-700">Not found</span>
+                          )}
+                          {r.status === 'error' && (
+                            <span className="text-red-700">Error</span>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="space-y-6">
+              {/* Doctor & Date (for show) */}
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <Label>Doctor's Name</Label>
+                  <Input
+                    value={doctorName}
+                    onChange={(e) => setDoctorName(e.target.value)}
+                    placeholder="Dr. Smith"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label>Date</Label>
+                  <Input
+                    type="date"
+                    value={prescriptionDate}
+                    onChange={(e) => setPrescriptionDate(e.target.value)}
+                  />
+                </div>
+              </div>
+
+              {/* Medicines */}
+              <div className="space-y-4">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-lg font-medium">Medicines</h3>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={addMedication}
+                  >
+                    <PlusCircle className="h-4 w-4 mr-1" />
+                    Add Medicine
+                  </Button>
+                </div>
+
+                {medications.map((med, idx) => (
+                  <div key={idx} className="border rounded-md p-4 space-y-4 bg-gray-50">
+                    {medications.length > 1 && (
+                      <button
+                        type="button"
+                        onClick={() => removeMedication(idx)}
+                        className="absolute top-2 right-2 text-red-500 hover:text-red-600"
+                        aria-label={`Remove medicine ${idx + 1}`}
+                        title="Remove medicine"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </button>
+                    )}
+
+                    <div className="grid grid-cols-2 gap-4">
+                      <div className="space-y-2">
+                        <Label>Medicine Name</Label>
+                        <Input
+                          value={med.name}
+                          onChange={(e) => updateMedication(idx, "name", e.target.value)}
+                          placeholder="Paracetamol"
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <Label>Composition</Label>
+                        <Input
+                          value={med.composition}
+                          onChange={(e) => updateMedication(idx, "composition", e.target.value)}
+                          placeholder="Acetaminophen 500mg"
+                        />
+                      </div>
+                    </div>
+
+                    {/* Search Results */}
+                    {searchResults[idx] && (
+                      <Alert variant={searchResults[idx].found ? "default" : "destructive"}>
+                        {searchResults[idx].found ? (
+                          <>
+                            <Check className="h-4 w-4 text-green-600" />
+                            <AlertDescription className="flex items-center justify-between w-full">
+                              <span>
+                                Found: {searchResults[idx].medicineName} 
+                                ({searchResults[idx].stock} in stock)
+                              </span>
+                              <Button
+                                size="sm"
+                                onClick={() => addToCartMutation.mutate({
+                                  medicineId: searchResults[idx].medicineId!
+                                })}
+                                disabled={addToCartMutation.isPending}
+                              >
+                                <ShoppingCart className="h-4 w-4 mr-1" />
+                                Add to Cart
+                              </Button>
+                            </AlertDescription>
+                          </>
+                        ) : (
+                          <>
+                            <XCircle className="h-4 w-4 text-red-600" />
+                            <AlertDescription>
+                              Medicine not found in our database
+                            </AlertDescription>
+                          </>
+                        )}
+                      </Alert>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </CardContent>
+        
+        <CardFooter className="flex flex-col space-y-3">
+          <Button 
+            className="w-full"
+            onClick={handleProcessPrescription}
+            disabled={
+              (!manualEntry && !capturedImage) || 
+              isRecognizing ||
+              extractMutation.isPending ||
+              isAutoProcessing ||
+              addToCartMutation.isPending ||
+              searchMutation.isPending
+            }
+          >
+            {isRecognizing || searchMutation.isPending || extractMutation.isPending || isAutoProcessing ? (
+              <>
+                <Loader className="mr-2 h-4 w-4 animate-spin" />
+                {isRecognizing
+                  ? 'Processing OCR...'
+                  : extractMutation.isPending
+                    ? 'Extracting...'
+                    : isAutoProcessing
+                      ? 'Adding to cart...'
+                      : 'Searching...'}
+              </>
+            ) : (
+              manualEntry ? "Search Medicines" : "Process Prescription"
+            )}
+          </Button>
+          
+          <Button 
+            variant="outline" 
+            className="w-full"
+            onClick={() => setManualEntry(!manualEntry)}
+            disabled={isRecognizing || extractMutation.isPending || isAutoProcessing || addToCartMutation.isPending || searchMutation.isPending}
+          >
+            {manualEntry ? "📷 Switch to Camera" : "✏️ Enter Manually"}
+          </Button>
+        </CardFooter>
+      </Card>
+    </div>
+  );
+}
+
